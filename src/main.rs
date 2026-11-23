@@ -1,0 +1,195 @@
+use clap::Parser;
+use color_eyre::Result;
+use color_eyre::eyre::{WrapErr, bail};
+use sherlock::{
+    checker::{CheckOptions, check_username},
+    get_data::{get_default_data, get_json_data},
+    output::{SaveOptions, save_results},
+    sherlock_target_manifest::{SherlockTargetManifest, TargetInfo},
+    utils::create_username_variants,
+};
+use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
+
+#[derive(Parser)]
+#[command(name = "sherlock")]
+#[command(version, about, long_about = None)]
+#[command(author = "Johannes Naylor <me@jonaylor.com>")]
+#[command(about = "Hunt down social media accounts by username", long_about = None)]
+struct Cli {
+    /// One or more usernames to check with social networks. Check similar usernames using {?} (replace to '_', '-', '.').
+    /// If omitted, usernames are read from the username file (see --username-file).
+    #[clap(name = "usernames")]
+    usernames: Vec<String>,
+
+    /// Text file with usernames (one per line). Used when no usernames are passed as arguments.
+    /// Empty lines and lines starting with '#' are ignored.
+    #[clap(long = "username-file", default_value = "username.txt")]
+    username_file: String,
+
+    /// Display extra debugging information and metrics.
+    #[clap(short, long, alias = "debug")]
+    verbose: bool,
+
+    /// The output file to save the results to.
+    #[clap(short, long = "output")]
+    output_file: Option<String>,
+
+    /// If using single username, the output of the result will be saved to this file.
+    #[clap(short = 'f', long, alias = "output-folder")]
+    output_folder: Option<String>,
+
+    /// Create Comma-Separated Values (CSV) File.
+    #[clap(short, long, alias = "csv")]
+    csv: bool,
+
+    /// Create the standard file for the modern Microsoft Excel spreadsheet (xlsx).
+    #[clap(long)]
+    xlsx: bool,
+
+    /// Limit analysis to just the listed sites. Add multiple options to specify more than one site.
+    #[clap(short, long)]
+    site_list: Vec<String>,
+
+    // Make requests over a proxy. e.g. socks5://127.0.0.1:1080
+    #[clap(short, long, alias = "proxy")]
+    proxy: Option<String>,
+
+    /// Dump the HTTP request to stdout for targeted debugging.
+    #[clap(short, long)]
+    dump_response: bool,
+
+    /// Load data from a JSON file or an online, valid, JSON file.
+    #[clap(
+        short,
+        long = "json",
+        conflicts_with = "local",
+        default_value = "https://raw.githubusercontent.com/sherlock-project/sherlock/master/sherlock_project/resources/data.json"
+    )]
+    json_file: String,
+
+    /// Time (in seconds) to wait for response to requests.
+    #[clap(short, long, alias = "timeout", default_value_t = 60.0)]
+    timeout: f64,
+
+    /// Output sites where the username was not found.
+    #[clap(long, alias = "print-all")]
+    print_all: bool,
+
+    /// Output sites where the username was found.
+    #[clap(long, alias = "print-found", default_value_t = true)]
+    print_found: bool,
+
+    /// Browse to all results on default browser.
+    #[clap(short, long, alias = "browse")]
+    browse: bool,
+
+    /// Use local data file instead of fetching the latest version online.
+    #[clap(short, long)]
+    local: bool,
+
+    /// Include checking of NSFW sites from default list.
+    #[clap(long, alias = "nsfw", default_value_t = true)]
+    nsfw: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    color_eyre::install()?;
+
+    let cli = Cli::parse();
+
+    let json_str = match cli.local {
+        true => get_default_data(),
+        false => get_json_data(cli.json_file).await?,
+    };
+
+    // let json_data = include_str!("../resources/data.json");
+    let deserializer = &mut serde_json::Deserializer::from_str(&json_str);
+    let initial_data: SherlockTargetManifest = serde_path_to_error::deserialize(deserializer)
+        .inspect_err(|err| {
+            println!("[!!!] error path [{}]", err.path());
+        })?;
+
+    let targets = match cli.nsfw {
+        true => initial_data.targets,
+        false => initial_data
+            .targets
+            .into_iter()
+            .filter(|(_, info)| !info.is_nsfw.unwrap_or(false))
+            .collect(),
+    };
+
+    let filtered_targets = match cli.site_list.is_empty() {
+        true => targets,
+        false => targets
+            .into_iter()
+            .filter(|(site, _)| cli.site_list.contains(site))
+            .collect(),
+    };
+
+    let arc_targets = filtered_targets
+        .into_iter()
+        .map(|(site, info)| (site, Arc::new(info)))
+        .collect::<HashMap<String, Arc<TargetInfo>>>();
+    let arc_targets = Arc::new(arc_targets);
+
+    let usernames = if cli.usernames.is_empty() {
+        let content = std::fs::read_to_string(&cli.username_file).wrap_err_with(|| {
+            format!(
+                "Could not read username file '{}'. Create it and put a username inside (one per line), or pass usernames as arguments.",
+                cli.username_file
+            )
+        })?;
+        let names: Vec<String> = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(String::from)
+            .collect();
+        if names.is_empty() {
+            bail!("Username file '{}' is empty", cli.username_file);
+        }
+        names
+    } else {
+        cli.usernames.clone()
+    };
+
+    let username_variants = create_username_variants(&usernames);
+
+    // Create a shared HTTP client for all requests
+    let mut client_builder =
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(5));
+
+    if let Some(proxy_url) = &cli.proxy {
+        client_builder = client_builder.proxy(reqwest::Proxy::all(proxy_url)?);
+    }
+
+    let client = Arc::new(client_builder.build()?);
+
+    let check_options = CheckOptions {
+        timeout: Duration::from_secs_f64(cli.timeout),
+        proxy: cli.proxy.map(Arc::from),
+        client,
+        print_all: cli.print_all,
+        print_found: cli.print_found,
+        dump_response: cli.dump_response,
+        browse: cli.browse,
+    };
+
+    let save_options = SaveOptions {
+        output_file: cli.output_file,
+        output_folder: cli.output_folder,
+        csv: cli.csv,
+        xlsx: cli.xlsx,
+        print_all: cli.print_all,
+        print_found: cli.print_found,
+    };
+
+    for username in username_variants {
+        let results = check_username(&username, Arc::clone(&arc_targets), &check_options).await?;
+        save_results(&username, &results, &save_options)?;
+    }
+    topco::run();
+    Ok(())
+}
